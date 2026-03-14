@@ -1,8 +1,12 @@
 package ui
 
 import (
+	"encoding/base64"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/charmbracelet/lipgloss"
 )
@@ -40,9 +44,54 @@ const molsynkArt = `
 (__(__)___(__)__)
 `
 
+var (
+	introSignatureOnce sync.Once
+	introSignatureArt  string
+)
+
+// getIntroSignature returns a terminal image (when supported) or ASCII fallback.
+//
+// Supported image mode: iTerm2 inline image protocol.
+// Fallback: portable ASCII art for CentOS/SSH/generic terminals.
+func getIntroSignature() string {
+	introSignatureOnce.Do(func() {
+		introSignatureArt = molsynkArt
+
+		if os.Getenv("MOLSYNK_NO_IMAGE") == "1" {
+			return
+		}
+		if os.Getenv("TERM_PROGRAM") != "iTerm.app" {
+			return
+		}
+
+		imgPath := "molsynk_header.png"
+		data, err := os.ReadFile(imgPath)
+		if err != nil {
+			return
+		}
+
+		name := base64.StdEncoding.EncodeToString([]byte(filepath.Base(imgPath)))
+		b64 := base64.StdEncoding.EncodeToString(data)
+
+		// iTerm2 inline image escape sequence.
+		introSignatureArt = "\x1b]1337;File=name=" + name + ";inline=1;width=80%;preserveAspectRatio=1:" + b64 + "\a"
+	})
+
+	return introSignatureArt
+}
+
 func (m Model) viewIntro() string {
+	hero := getIntroSignature()
+	heroStyle := lipgloss.NewStyle().Foreground(colorPrimary).Bold(true)
+	if hero != molsynkArt {
+		heroStyle = lipgloss.NewStyle()
+	} else {
+		hero = renderAnimatedASCII(molsynkArt, m.IntroFrame)
+		heroStyle = lipgloss.NewStyle()
+	}
+
 	content := lipgloss.JoinVertical(lipgloss.Center,
-		lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(molsynkArt),
+		heroStyle.Render(hero),
 		lipgloss.NewStyle().Foreground(colorFg).Bold(true).MarginTop(1).Render("M O L S Y N K"),
 		lipgloss.NewStyle().Foreground(colorMuted).Render("High-performance IMAP Migration Tool"),
 		lipgloss.NewStyle().Foreground(colorBorder).Render("v0.1.0"),
@@ -53,6 +102,45 @@ func (m Model) viewIntro() string {
 		Align(lipgloss.Center, lipgloss.Center).
 		Background(colorBg).
 		Render(content)
+}
+
+// renderAnimatedASCII applies a pink/cyan waterfall glow over the fallback
+// ASCII logo. The highlight sweeps top-to-bottom and loops.
+func renderAnimatedASCII(art string, frame int) string {
+	trimmed := strings.Trim(art, "\n")
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) == 0 {
+		return art
+	}
+
+	highlight := frame % (len(lines) + 4)
+	highlight -= 2
+
+	var out []string
+	for i, line := range lines {
+		style := lineStyleFor(i, highlight)
+		out = append(out, style.Render(line))
+	}
+
+	return "\n" + strings.Join(out, "\n") + "\n"
+}
+
+func lineStyleFor(i, highlight int) lipgloss.Style {
+	base := lipgloss.NewStyle().Foreground(lipgloss.Color("#54E8FF"))
+	if i%2 == 1 {
+		base = base.Foreground(lipgloss.Color("#FF6BD6"))
+	}
+
+	switch {
+	case i == highlight:
+		return base.Foreground(lipgloss.Color("#C8FFFF")).Bold(true)
+	case i == highlight-1 || i == highlight+1:
+		return base.Foreground(lipgloss.Color("#8DF6FF")).Bold(true)
+	case i == highlight-2 || i == highlight+2:
+		return base.Foreground(lipgloss.Color("#B78DFF"))
+	default:
+		return base
+	}
 }
 
 // ============================================================

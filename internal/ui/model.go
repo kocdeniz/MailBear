@@ -149,8 +149,9 @@ type AccountState struct {
 
 type Model struct {
 	// Navigation
-	Phase     AppPhase
-	InputMode InputMode
+	Phase      AppPhase
+	InputMode  InputMode
+	IntroFrame int
 
 	// ---- PhaseManual fields ------------------------------------------------
 	Inputs       [fieldCount]textinput.Model

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -16,7 +17,15 @@ import (
 
 // Init — start at the intro screen.
 func (m Model) Init() tea.Cmd {
-	return textinput.Blink
+	return tea.Batch(textinput.Blink, introTick())
+}
+
+type introTickMsg time.Time
+
+func introTick() tea.Cmd {
+	return tea.Tick(120*time.Millisecond, func(t time.Time) tea.Msg {
+		return introTickMsg(t)
+	})
 }
 
 // Update — global resize + connection messages, then phase dispatch.
@@ -71,8 +80,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // ============================================================
 
 func (m Model) updateIntro(msg tea.Msg) (tea.Model, tea.Cmd) {
-	if key, ok := msg.(tea.KeyMsg); ok {
-		switch key.String() {
+	switch msg := msg.(type) {
+	case introTickMsg:
+		_ = msg
+		m.IntroFrame++
+		return m, introTick()
+
+	case tea.KeyMsg:
+		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
 		default:
@@ -80,6 +95,7 @@ func (m Model) updateIntro(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	}
+
 	return m, nil
 }
 
