@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/charmbracelet/lipgloss"
+	"imapsync/internal/buildinfo"
 )
 
 // View dispatches rendering to the active phase.
@@ -94,7 +95,7 @@ func (m Model) viewIntro() string {
 		heroStyle.Render(hero),
 		lipgloss.NewStyle().Foreground(colorFg).Bold(true).MarginTop(1).Render("M O L S Y N K"),
 		lipgloss.NewStyle().Foreground(colorMuted).Render("High-performance IMAP Migration Tool"),
-		lipgloss.NewStyle().Foreground(colorBorder).Render("v0.1.0"),
+		lipgloss.NewStyle().Foreground(colorBorder).Render(buildinfo.IntroLabel()),
 		lipgloss.NewStyle().Foreground(colorMuted).MarginTop(2).Render("Press any key to continue   [q] Quit"),
 	)
 	return lipgloss.NewStyle().

@@ -15,9 +15,39 @@ message transfer, and compatibility with older Linux systems.
 - Real IMAP authentication and folder discovery
 - Folder creation on destination when needed
 - UID-based message copy from source to destination
+- Smart Retry with exponential backoff (`2s`, `5s`, `10s` + jitter)
+- O(1) duplicate detection via in-memory `Message-ID` cache
+- Batch metadata fetch for faster pre-filtering (`50` per batch)
+- Parallel folder workers (up to `3` concurrently)
+- Checkpoint persistence (`migration_state.json`) for bulk resume/skip
 - Real-time activity log and progress updates
 - Per-account fault isolation in bulk mode (continue on errors)
 - `CGO_ENABLED=0` compatible build
+
+## Why MOLSYNK is different
+
+### Smart Retry (resilience under real-world server pressure)
+
+MOLSYNK does not fail fast on transient IMAP/network errors. It automatically:
+
+- Detects retryable errors (`timeout`, `server busy`, throttling patterns)
+- Retries with exponential backoff (`2s`, `5s`, `10s`) + jitter
+- Attempts socket/session recovery to avoid zombie connections
+- Continues processing other folders/accounts when one unit fails
+
+This is especially important on SmarterMail and enterprise servers with
+throttling/rate-limit behavior.
+
+### O(1) Caching (imapsync-style speed path)
+
+Instead of running a slow duplicate search per message, MOLSYNK:
+
+1. Loads destination folder `Message-ID` values once into memory
+2. Keeps them in a `map[string]bool`
+3. Uses O(1) lookup per source message
+
+This removes repeated server-side search overhead and is one of the key reasons
+for high throughput in large migrations.
 
 ## Requirements
 
@@ -95,13 +125,13 @@ Notes:
 For each account pair:
 
 1. Connect and authenticate to source and destination IMAP servers.
-2. List source folders.
+2. List source folders and process folders with a worker pool.
 3. Ensure each folder exists on destination (`CREATE` if needed).
-4. `UID SEARCH` source folder.
-5. For each UID:
-   - `FETCH BODY[]` from source
-   - `APPEND` to destination folder
-6. Emit live status updates to the TUI via channel messages.
+4. Preload destination `Message-ID` cache (single batched pass).
+5. Fetch source metadata in batches (`UID`, `Message-ID`, size).
+6. O(1) map lookup to skip duplicates before body transfer.
+7. Transfer only required messages (`FETCH BODY[]` -> `APPEND`).
+8. Emit live status/speed updates to the TUI via channel messages.
 
 If a folder or account fails, the error is logged and migration continues with
 the next item.
@@ -132,8 +162,7 @@ internal/imap/           # IMAP client wrapper and transfer operations
 ## Known limitations
 
 - No dry-run mode yet
-- No final summary report export yet
-- No retry/backoff policy yet (errors are logged and processing continues)
+- No exported summary artifact (e.g. JSON/CSV report file) yet
 
 ## Status
 
