@@ -3,11 +3,14 @@ package ui
 import (
 	"fmt"
 	"net"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -22,10 +25,39 @@ func (m Model) Init() tea.Cmd {
 
 type introTickMsg time.Time
 
+type logOpenResultMsg struct {
+	Err error
+}
+
 func introTick() tea.Cmd {
 	return tea.Tick(120*time.Millisecond, func(t time.Time) tea.Msg {
 		return introTickMsg(t)
 	})
+}
+
+func openLogFileCmd(path string) tea.Cmd {
+	return func() tea.Msg {
+		if strings.TrimSpace(path) == "" {
+			path = "molsynk.log"
+		}
+
+		var cmd *exec.Cmd
+		switch runtime.GOOS {
+		case "darwin":
+			cmd = exec.Command("open", path)
+		case "linux":
+			cmd = exec.Command("xdg-open", path)
+		case "windows":
+			cmd = exec.Command("cmd", "/c", "start", path)
+		default:
+			return logOpenResultMsg{Err: fmt.Errorf("unsupported platform for auto-open")}
+		}
+
+		if err := cmd.Start(); err != nil {
+			return logOpenResultMsg{Err: err}
+		}
+		return logOpenResultMsg{}
+	}
 }
 
 // Update — global resize + connection messages, then phase dispatch.
@@ -35,6 +67,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.Width = ws.Width
 		m.Height = ws.Height
 		m.Progress.Width = ws.Width - 8
+		lw := ws.Width - 14
+		if lw < 20 {
+			lw = 20
+		}
+		m.LogView.Width = lw
+		m.LogView.Height = 8
+		m.refreshLogViewport(false)
 		return m, nil
 	}
 
@@ -296,13 +335,28 @@ func (m Model) submitBulkForm() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	pending, skipped, statePath, err := sync.FilterCompletedAccounts(pairs)
+	if err != nil {
+		m.BulkErr = err.Error()
+		return m, nil
+	}
+	if skipped > 0 {
+		m.AddLog(LogInfo, fmt.Sprintf("[STATE] Loaded. Skipping %d completed accounts.", skipped))
+	}
+	if len(pending) == 0 {
+		m.Phase = PhaseDash
+		m.State = StateDone
+		m.AddLog(LogSuccess, "No pending accounts. All accounts are already completed in state file.")
+		return m, nil
+	}
+
 	// Build the account queue for the dashboard
-	m.AccountQueue = make([]AccountState, len(pairs))
-	for i, p := range pairs {
+	m.AccountQueue = make([]AccountState, len(pending))
+	for i, p := range pending {
 		m.AccountQueue[i] = AccountState{Username: p.SrcCfg.Username}
 	}
 	m.CurrentAccountIdx = 0
-	m.ActiveAccount = pairs[0].SrcCfg.Username
+	m.ActiveAccount = pending[0].SrcCfg.Username
 
 	// Global host display info
 	m.SrcConfig = ConnConfig{Host: srcHost, Port: srcPort, TLS: srcTLS}
@@ -315,10 +369,10 @@ func (m Model) submitBulkForm() (tea.Model, tea.Cmd) {
 	m.DstState = ConnReady
 	m.AddLog(LogInfo, fmt.Sprintf(
 		"Starting bulk migration: %d accounts from %s -> %s",
-		len(pairs), srcHost, dstHost,
+		len(pending), srcHost, dstHost,
 	))
 
-	cmd, ch := sync.RunMigration(pairs)
+	cmd, ch := sync.RunMigrationWithCheckpoint(pending, statePath)
 	m.StatusCh = ch
 	return m, cmd
 }
@@ -329,6 +383,14 @@ func (m Model) submitBulkForm() (tea.Model, tea.Cmd) {
 
 func (m Model) updateDash(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+
+	case logOpenResultMsg:
+		if msg.Err != nil {
+			m.AddLog(LogWarn, fmt.Sprintf("[LOG] Could not open log file: %v", msg.Err))
+		} else {
+			m.AddLog(LogInfo, "[LOG] Opening log file...")
+		}
+		return m, nil
 
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -369,6 +431,29 @@ func (m Model) updateDash(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		if m.State == StateDone && msg.String() == "r" {
+			return m, openLogFileCmd(m.LogFilePath)
+		}
+
+		// Clipboard copy of currently visible log lines.
+		if msg.String() == "c" {
+			text := m.currentVisibleLogText()
+			if err := clipboard.WriteAll(text); err != nil {
+				m.AddLog(LogWarn, fmt.Sprintf("[CLIPBOARD] Copy failed: %v", err))
+			} else {
+				m.AddLog(LogInfo, "[CLIPBOARD] Current log view copied.")
+			}
+			return m, nil
+		}
+
+		// Log viewport scrolling
+		switch msg.String() {
+		case "up", "down", "pgup", "pgdown", "home", "end":
+			var cmd tea.Cmd
+			m.LogView, cmd = m.LogView.Update(msg)
+			return m, cmd
+		}
+
 	// ---- Real engine status updates ------------------------------------
 	case sync.StatusUpdateMsg:
 		return m.applyStatusUpdate(msg)
@@ -390,10 +475,25 @@ func (m Model) applyStatusUpdate(msg sync.StatusUpdateMsg) (tea.Model, tea.Cmd) 
 
 	case sync.StatusAccountStart:
 		m.ActiveAccount = msg.Account
+		if m.OverallStartedAt.IsZero() {
+			m.OverallStartedAt = time.Now()
+		}
+		m.SpeedStartedAt = time.Now()
+		m.SpeedMsgCount = 0
+		m.SpeedBytesTotal = 0
+		m.SpeedMailsPerS = 0
+		m.SpeedKBPerS = 0
 		// Find and mark active in queue
 		for i := range m.AccountQueue {
 			if m.AccountQueue[i].Username == msg.Account {
 				m.CurrentAccountIdx = i
+				m.AccountQueue[i].ErrMsg = ""
+				m.AccountQueue[i].Failed = false
+				m.AccountQueue[i].Done = false
+				m.AccountQueue[i].MigratedMessages = 0
+				m.AccountQueue[i].MigratedBytes = 0
+				m.AccountQueue[i].SkippedMessages = 0
+				m.AccountQueue[i].FolderErrors = nil
 				break
 			}
 		}
@@ -406,6 +506,12 @@ func (m Model) applyStatusUpdate(msg sync.StatusUpdateMsg) (tea.Model, tea.Cmd) 
 		for i := range m.AccountQueue {
 			if m.AccountQueue[i].Username == msg.Account {
 				m.AccountQueue[i].Done = true
+				if msg.Stats != nil {
+					m.AccountQueue[i].MigratedMessages = msg.Stats.MigratedMessages
+					m.AccountQueue[i].MigratedBytes = msg.Stats.MigratedBytes
+					m.AccountQueue[i].SkippedMessages = msg.Stats.SkippedDuplicates
+					m.AccountQueue[i].FolderErrors = append([]string(nil), msg.Stats.FolderErrors...)
+				}
 				break
 			}
 		}
@@ -416,10 +522,24 @@ func (m Model) applyStatusUpdate(msg sync.StatusUpdateMsg) (tea.Model, tea.Cmd) 
 			if m.AccountQueue[i].Username == msg.Account {
 				m.AccountQueue[i].Failed = true
 				m.AccountQueue[i].ErrMsg = msg.Err.Error()
+				if msg.Folder != "" {
+					m.AccountQueue[i].FolderErrors = append(m.AccountQueue[i].FolderErrors, fmt.Sprintf("%s: %v", msg.Folder, msg.Err))
+				}
 				break
 			}
 		}
 		m.AddLog(LogError, fmt.Sprintf("[%s] error: %s", msg.Account, msg.Err))
+
+	case sync.StatusRetrying:
+		waitSec := msg.RetryAfterS
+		if waitSec <= 0 {
+			waitSec = 2
+		}
+		errText := strings.ToLower(fmt.Sprint(msg.Err))
+		if strings.Contains(errText, "closed network connection") || strings.Contains(errText, "timeout") {
+			m.AddLog(LogWarn, "[NETWORK] Connection lost. Attempting auto-reconnection....")
+		}
+		m.AddLog(LogWarn, fmt.Sprintf("[RETRYING] Connection lost. Reconnecting in %d seconds... (%v)", waitSec, msg.Err))
 
 	case sync.StatusFolderStart:
 		// Add or reset the folder entry
@@ -447,11 +567,49 @@ func (m Model) applyStatusUpdate(msg sync.StatusUpdateMsg) (tea.Model, tea.Cmd) 
 				break
 			}
 		}
+		for i := range m.AccountQueue {
+			if m.AccountQueue[i].Username == msg.Account {
+				m.AccountQueue[i].MigratedMessages++
+				m.AccountQueue[i].MigratedBytes += msg.MovedBytesDelta
+				break
+			}
+		}
+		m.SpeedMsgCount++
+		m.SpeedBytesTotal += msg.MovedBytesDelta
+		m.OverallMigratedMails++
+		m.OverallTransferredB += msg.MovedBytesDelta
+		if !m.SpeedStartedAt.IsZero() {
+			elapsed := time.Since(m.SpeedStartedAt).Seconds()
+			if elapsed > 0 {
+				m.SpeedMailsPerS = float64(m.SpeedMsgCount) / elapsed
+				m.SpeedKBPerS = (float64(m.SpeedBytesTotal) / 1024.0) / elapsed
+			}
+		}
 		// Recompute total synced
 		m.SyncedMessages = 0
 		for _, f := range m.Folders {
 			m.SyncedMessages += f.Synced
 		}
+
+	case sync.StatusMessageSkipped:
+		for i := range m.AccountQueue {
+			if m.AccountQueue[i].Username == msg.Account {
+				m.AccountQueue[i].SkippedMessages += msg.SkippedDelta
+				break
+			}
+		}
+		m.OverallSkippedMails += msg.SkippedDelta
+
+	case sync.StatusReportPlaced:
+		m.AddLog(LogInfo, "[REPORT] Summary email placed in destination Inbox.")
+
+	case sync.StatusStateSaving:
+		m.StateSaving = true
+		m.AddLog(LogInfo, "[STATE] Saving checkpoint...")
+
+	case sync.StatusStateSaved:
+		m.StateSaving = false
+		m.AddLog(LogInfo, "[STATE] Checkpoint saved.")
 
 	case sync.StatusFolderDone:
 		for i := range m.Folders {
@@ -465,6 +623,14 @@ func (m Model) applyStatusUpdate(msg sync.StatusUpdateMsg) (tea.Model, tea.Cmd) 
 
 	case sync.StatusMigrationDone:
 		m.State = StateDone
+		m.StateSaving = false
+		m.OverallEndedAt = time.Now()
+		if !m.OverallStartedAt.IsZero() {
+			elapsed := m.OverallEndedAt.Sub(m.OverallStartedAt).Seconds()
+			if elapsed > 0 {
+				m.OverallAvgMailsPerSec = float64(m.OverallMigratedMails) / elapsed
+			}
+		}
 		m.AddLog(LogSuccess, "All migrations complete.")
 		// Update progress bar to 100%
 		return m, m.Progress.SetPercent(1.0)

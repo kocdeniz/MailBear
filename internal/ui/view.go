@@ -297,6 +297,10 @@ func (m Model) renderBulkField(idx int, w int) string {
 // ============================================================
 
 func (m Model) viewDash() string {
+	if m.State == StateDone {
+		return m.renderFinalSummary()
+	}
+
 	sections := []string{
 		m.renderDashTitle(),
 		m.renderConnections(),
@@ -307,6 +311,58 @@ func (m Model) viewDash() string {
 		m.renderDashFooter(),
 	}
 	return AppStyle.Render(strings.Join(sections, "\n"))
+}
+
+func (m Model) renderFinalSummary() string {
+	totalAccounts := len(m.AccountQueue)
+	if totalAccounts == 0 {
+		totalAccounts = 1
+	}
+	processed := m.OverallMigratedMails + m.OverallSkippedMails
+	gb := float64(m.OverallTransferredB) / (1024 * 1024 * 1024)
+
+	elapsedMin := 0.0
+	if !m.OverallStartedAt.IsZero() && !m.OverallEndedAt.IsZero() {
+		elapsedMin = m.OverallEndedAt.Sub(m.OverallStartedAt).Minutes()
+	}
+
+	title := lipgloss.NewStyle().
+		Foreground(colorPrimary).
+		Bold(true).
+		Render("MOLSYNK  --  Migration Complete")
+
+	metricLabel := lipgloss.NewStyle().Foreground(colorMuted)
+	metricValue := lipgloss.NewStyle().Foreground(colorSuccess).Bold(true)
+
+	lines := []string{
+		title,
+		"",
+		metricLabel.Render("Total Accounts:") + " " + metricValue.Render(fmt.Sprintf("%d", totalAccounts)),
+		metricLabel.Render("Total Mails Processed:") + " " + metricValue.Render(fmt.Sprintf("%d", processed)),
+		metricLabel.Render("Total Data Transferred:") + " " + metricValue.Render(fmt.Sprintf("%.2f GB", gb)),
+		metricLabel.Render("Average Speed:") + " " + metricValue.Render(fmt.Sprintf("%.2f mails/s", m.OverallAvgMailsPerSec)),
+		metricLabel.Render("Total Time Elapsed:") + " " + metricValue.Render(fmt.Sprintf("%.2f min", elapsedMin)),
+		"",
+		lipgloss.NewStyle().Foreground(colorWarning).Render("Press [q] to exit or [r] to open the log file"),
+		"",
+		lipgloss.NewStyle().Foreground(colorPrimary).Render("   /\\_____/\\"),
+		lipgloss.NewStyle().Foreground(colorPrimary).Render("  (  Job Done! )"),
+		lipgloss.NewStyle().Foreground(colorPrimary).Render("   \\_____/"),
+	}
+
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colorPrimary).
+		Padding(1, 2).
+		Width(clamp(m.Width-12, 52, 90)).
+		Render(strings.Join(lines, "\n"))
+
+	return lipgloss.NewStyle().
+		Width(m.Width).
+		Height(m.Height).
+		Align(lipgloss.Center, lipgloss.Center).
+		Background(colorBg).
+		Render(box)
 }
 
 func (m Model) renderDashTitle() string {
@@ -441,41 +497,32 @@ func (m Model) renderProgress() string {
 	if bar == "" {
 		bar = lipgloss.NewStyle().Foreground(colorMuted).Render("  (no active sync)")
 	}
+	speed := lipgloss.NewStyle().Foreground(colorMuted).Render(
+		fmt.Sprintf("Speed: %.2f mails/s  %.1f KB/s", m.SpeedMailsPerS, m.SpeedKBPerS),
+	)
+	stateLine := ""
+	if m.StateSaving {
+		stateLine = "\n" + lipgloss.NewStyle().Foreground(colorWarning).Render("[STATE] saving checkpoint...")
+	}
 	return PanelStyle.Width(m.Width - 8).Render(
-		header + "\n" + bar + "\n" +
+		header + "\n" + bar + "\n" + speed + stateLine + "\n" +
 			lipgloss.NewStyle().Foreground(colorWarning).Render(m.stateLabel()),
 	)
 }
 
 func (m Model) renderLog() string {
-	const visible = 6
 	header := SectionLabelStyle.Render("ACTIVITY LOG")
 	if len(m.Log) == 0 {
 		return LogStyle.Width(m.Width - 8).Render(
 			header + "\n" + lipgloss.NewStyle().Foreground(colorMuted).Render("  No activity yet."),
 		)
 	}
-	start := len(m.Log) - visible
-	if start < 0 {
-		start = 0
+	content := m.LogView.View()
+	if strings.TrimSpace(content) == "" {
+		content = lipgloss.NewStyle().Foreground(colorMuted).Render("  No activity yet.")
 	}
-	var sb strings.Builder
-	sb.WriteString(header + "\n")
-	for _, e := range m.Log[start:] {
-		style := LogLineStyle
-		switch e.Level {
-		case LogWarn:
-			style = style.Foreground(colorWarning)
-		case LogError:
-			style = style.Foreground(colorError)
-		case LogSuccess:
-			style = style.Foreground(colorSuccess)
-		default:
-			style = style.Foreground(colorFg)
-		}
-		sb.WriteString("  " + style.Render(e.Text) + "\n")
-	}
-	return LogStyle.Width(m.Width - 8).Render(strings.TrimRight(sb.String(), "\n"))
+	hints := lipgloss.NewStyle().Foreground(colorMuted).Render("[up/down/pgup/pgdown] scroll  [c] copy")
+	return LogStyle.Width(m.Width - 8).Render(header + "\n" + content + "\n" + hints)
 }
 
 func (m Model) renderDashFooter() string {

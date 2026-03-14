@@ -1,8 +1,14 @@
 package ui
 
 import (
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
 	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	imapconn "imapsync/internal/imap"
 	"imapsync/internal/sync"
 )
@@ -143,6 +149,11 @@ type AccountState struct {
 	Done     bool
 	Failed   bool
 	ErrMsg   string
+
+	MigratedMessages int
+	MigratedBytes    int64
+	SkippedMessages  int
+	FolderErrors     []string
 }
 
 // ---- Root model --------------------------------------------------------------
@@ -187,7 +198,25 @@ type Model struct {
 
 	Progress progress.Model
 	Log      []LogEntry
+	LogView  viewport.Model
 	State    AppState
+
+	// Live transfer speed metrics
+	SpeedStartedAt  time.Time
+	SpeedMsgCount   int
+	SpeedBytesTotal int64
+	SpeedMailsPerS  float64
+	SpeedKBPerS     float64
+	StateSaving     bool
+	LogFilePath     string
+
+	// Final summary aggregates for the completed state
+	OverallStartedAt      time.Time
+	OverallEndedAt        time.Time
+	OverallMigratedMails  int
+	OverallSkippedMails   int
+	OverallTransferredB   int64
+	OverallAvgMailsPerSec float64
 
 	// Live IMAP connections (manual mode)
 	SrcClient *imapconn.Client
@@ -201,6 +230,7 @@ type Model struct {
 // ---- Log helpers -------------------------------------------------------------
 
 type LogEntry struct {
+	Time  time.Time
 	Text  string
 	Level LogLevel
 }
@@ -216,10 +246,77 @@ const (
 
 func (m *Model) AddLog(level LogLevel, text string) {
 	const maxEntries = 200
-	m.Log = append(m.Log, LogEntry{Level: level, Text: text})
+	follow := m.LogView.AtBottom()
+	entry := LogEntry{Time: time.Now(), Level: level, Text: text}
+	m.Log = append(m.Log, entry)
 	if len(m.Log) > maxEntries {
 		m.Log = m.Log[len(m.Log)-maxEntries:]
 	}
+	m.appendLogToFile(entry)
+	m.refreshLogViewport(follow)
+}
+
+func (m *Model) appendLogToFile(e LogEntry) {
+	path := m.LogFilePath
+	if path == "" {
+		path = "molsynk.log"
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	level := "INFO"
+	switch e.Level {
+	case LogWarn:
+		level = "WARN"
+	case LogError:
+		level = "ERROR"
+	case LogSuccess:
+		level = "SUCCESS"
+	}
+	_, _ = f.WriteString(fmt.Sprintf("%s [%s] %s\n", e.Time.Format(time.RFC3339), level, e.Text))
+}
+
+func (m *Model) refreshLogViewport(followBottom bool) {
+	if m.LogView.Height <= 0 {
+		m.LogView.Height = 8
+	}
+	if m.LogView.Width <= 0 {
+		m.LogView.Width = 80
+	}
+	lines := make([]string, 0, len(m.Log))
+	for _, e := range m.Log {
+		lines = append(lines, fmt.Sprintf("[%s] %s", e.Time.Format("15:04:05"), e.Text))
+	}
+	m.LogView.SetContent(strings.Join(lines, "\n"))
+	if followBottom {
+		m.LogView.GotoBottom()
+	}
+}
+
+func (m Model) currentVisibleLogText() string {
+	if len(m.Log) == 0 {
+		return ""
+	}
+	start := m.LogView.YOffset
+	if start < 0 {
+		start = 0
+	}
+	end := start + m.LogView.Height
+	if end > len(m.Log) {
+		end = len(m.Log)
+	}
+	if start >= len(m.Log) {
+		start = len(m.Log) - 1
+	}
+
+	lines := make([]string, 0, end-start)
+	for _, e := range m.Log[start:end] {
+		lines = append(lines, fmt.Sprintf("[%s] %s", e.Time.Format("15:04:05"), e.Text))
+	}
+	return strings.Join(lines, "\n")
 }
 
 // ---- Constructor -------------------------------------------------------------
@@ -273,9 +370,11 @@ func NewModel(prog progress.Model) Model {
 	bulkInputs[0].Focus()
 
 	return Model{
-		Phase:      PhaseIntro,
-		Inputs:     inputs,
-		BulkInputs: bulkInputs,
-		Progress:   prog,
+		Phase:       PhaseIntro,
+		Inputs:      inputs,
+		BulkInputs:  bulkInputs,
+		LogView:     viewport.New(80, 8),
+		LogFilePath: "molsynk.log",
+		Progress:    prog,
 	}
 }

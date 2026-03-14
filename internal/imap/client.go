@@ -7,9 +7,11 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"time"
 
 	imaplib "github.com/emersion/go-imap/v2"
@@ -43,6 +45,64 @@ func (c Config) Addr() string { return fmt.Sprintf("%s:%d", c.Host, c.Port) }
 type Client struct {
 	inner *imapclient.Client
 	Cfg   Config
+}
+
+// TransferOutcome describes the result of attempting one message transfer.
+type TransferOutcome struct {
+	Migrated         bool
+	SkippedDuplicate bool
+	SizeBytes        int64
+}
+
+// MessageMeta holds lightweight header metadata for a message.
+type MessageMeta struct {
+	UID       imaplib.UID
+	MessageID string
+	SizeBytes int64
+}
+
+// IsRetryableError returns true when an IMAP operation should be retried.
+// It covers transient network failures and common server-throttling messages.
+func IsRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			return true
+		}
+	}
+
+	msg := strings.ToLower(err.Error())
+	transient := []string{
+		"timeout",
+		"connection reset",
+		"broken pipe",
+		"temporarily unavailable",
+		"server busy",
+		"rate limit",
+		"throttl",
+		"too many requests",
+		"try again",
+	}
+	for _, s := range transient {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// IsConnectionLostError returns true for hard disconnect symptoms.
+func IsConnectionLostError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "closed network connection") || strings.Contains(msg, "connection reset") || strings.Contains(msg, "broken pipe") || strings.Contains(msg, "timeout")
 }
 
 // Connect dials and authenticates. Pure-Go TLS (no CGO).
@@ -80,6 +140,37 @@ func Connect(cfg Config) (*Client, error) {
 func (cl *Client) Close() {
 	_ = cl.inner.Logout().Wait()
 	_ = cl.inner.Close()
+}
+
+// Reconnect force-closes the old socket and opens a fresh authenticated session.
+func (cl *Client) Reconnect() error {
+	_ = cl.inner.Close()
+	nc, err := Connect(cl.Cfg)
+	if err != nil {
+		return err
+	}
+	cl.inner = nc.inner
+	return nil
+}
+
+// StartKeepAlive sends NOOP every 30 seconds to keep long-lived sessions active.
+// The goroutine exits when stop is closed.
+func (cl *Client) StartKeepAlive(stop <-chan struct{}, onError func(error)) {
+	go func() {
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				if err := cl.inner.Noop().Wait(); err != nil && onError != nil {
+					onError(fmt.Errorf("NOOP %s: %w", cl.Cfg.Username, err))
+				}
+			}
+		}
+	}()
 }
 
 // ---- Folder operations -------------------------------------------------------
@@ -155,10 +246,121 @@ func (cl *Client) FetchUIDs(folder string) ([]imaplib.UID, error) {
 	return searchData.AllUIDs(), nil
 }
 
+// FetchMessageMetaBatch fetches UID + Envelope.MessageID + RFC822Size for a
+// batch of UIDs in a single IMAP FETCH command.
+func (cl *Client) FetchMessageMetaBatch(folder string, uids []imaplib.UID) ([]MessageMeta, error) {
+	if len(uids) == 0 {
+		return nil, nil
+	}
+
+	_, err := cl.inner.Select(folder, &imaplib.SelectOptions{ReadOnly: true}).Wait()
+	if err != nil {
+		return nil, fmt.Errorf("SELECT %s: %w", folder, err)
+	}
+
+	set := imaplib.UIDSetNum(uids...)
+	bufs, err := cl.inner.Fetch(set, &imaplib.FetchOptions{
+		UID:        true,
+		Envelope:   true,
+		RFC822Size: true,
+	}).Collect()
+	if err != nil {
+		return nil, fmt.Errorf("FETCH meta %s: %w", folder, err)
+	}
+
+	out := make([]MessageMeta, 0, len(bufs))
+	for _, b := range bufs {
+		id := ""
+		if b.Envelope != nil {
+			id = strings.TrimSpace(b.Envelope.MessageID)
+		}
+		out = append(out, MessageMeta{
+			UID:       b.UID,
+			MessageID: normalizeMessageID(id),
+			SizeBytes: b.RFC822Size,
+		})
+	}
+
+	return out, nil
+}
+
+// FetchAllMessageIDCache fetches all message IDs from destination folder and
+// stores them in memory for O(1) duplicate checks.
+func (cl *Client) FetchAllMessageIDCache(folder string) (map[string]bool, error) {
+	uids, err := cl.FetchUIDs(folder)
+	if err != nil {
+		return nil, err
+	}
+	cache := make(map[string]bool, len(uids))
+	if len(uids) == 0 {
+		return cache, nil
+	}
+
+	const batchSize = 100
+	for i := 0; i < len(uids); i += batchSize {
+		end := i + batchSize
+		if end > len(uids) {
+			end = len(uids)
+		}
+		meta, err := cl.FetchMessageMetaBatch(folder, uids[i:end])
+		if err != nil {
+			return nil, err
+		}
+		for _, m := range meta {
+			if m.MessageID != "" {
+				cache[m.MessageID] = true
+			}
+		}
+	}
+
+	return cache, nil
+}
+
+// HasMessageID checks whether destination mailbox already contains a message
+// with this Message-ID. Used as a basic duplicate-prevention mechanism.
+func (cl *Client) HasMessageID(folder, messageID string) (bool, error) {
+	if strings.TrimSpace(messageID) == "" {
+		return false, nil
+	}
+
+	_, err := cl.inner.Select(folder, &imaplib.SelectOptions{ReadOnly: true}).Wait()
+	if err != nil {
+		return false, fmt.Errorf("SELECT %s: %w", folder, err)
+	}
+
+	criteria := &imaplib.SearchCriteria{
+		Header: []imaplib.SearchCriteriaHeaderField{{
+			Key:   "Message-ID",
+			Value: messageID,
+		}},
+	}
+
+	data, err := cl.inner.UIDSearch(criteria, nil).Wait()
+	if err != nil {
+		return false, fmt.Errorf("UID SEARCH Message-ID in %s: %w", folder, err)
+	}
+	return len(data.AllUIDs()) > 0, nil
+}
+
+// AppendRawMessage appends a fully formed RFC-5322 message to mailbox.
+func (cl *Client) AppendRawMessage(mailbox string, raw []byte) error {
+	appendCmd := cl.inner.Append(mailbox, int64(len(raw)), &imaplib.AppendOptions{})
+	if _, err := io.Copy(appendCmd, bytes.NewReader(raw)); err != nil {
+		return fmt.Errorf("APPEND stream %s: %w", mailbox, err)
+	}
+	if err := appendCmd.Close(); err != nil {
+		return fmt.Errorf("APPEND close %s: %w", mailbox, err)
+	}
+	if _, err := appendCmd.Wait(); err != nil {
+		return fmt.Errorf("APPEND wait %s: %w", mailbox, err)
+	}
+	return nil
+}
+
 // TransferMessage fetches the raw RFC-5322 body of one message by UID from
 // this client and APPENDs it to dstFolder on dst.
 // An io.Pipe keeps peak RAM usage bounded to one message at a time.
-func (cl *Client) TransferMessage(uid imaplib.UID, dst *Client, dstFolder string) error {
+func (cl *Client) TransferMessage(uid imaplib.UID, dst *Client, dstFolder string) (TransferOutcome, error) {
 	// UID FETCH <uid> BODY[]
 	uidSet := imaplib.UIDSetNum(uid)
 	fetchOpts := &imaplib.FetchOptions{
@@ -169,7 +371,7 @@ func (cl *Client) TransferMessage(uid imaplib.UID, dst *Client, dstFolder string
 
 	msgData := fetchCmd.Next()
 	if msgData == nil {
-		return fmt.Errorf("FETCH uid %d: no message data", uid)
+		return TransferOutcome{}, fmt.Errorf("FETCH uid %d: no message data", uid)
 	}
 
 	// Walk the fetch items to find the body section literal
@@ -185,18 +387,19 @@ func (cl *Client) TransferMessage(uid imaplib.UID, dst *Client, dstFolder string
 		}
 	}
 	if bodyReader == nil {
-		return fmt.Errorf("FETCH uid %d: no body section in response", uid)
+		return TransferOutcome{}, fmt.Errorf("FETCH uid %d: no body section in response", uid)
 	}
 
 	// Buffer the message body — required to know the exact size for APPEND
 	var buf bytes.Buffer
 	bw := bufio.NewWriterSize(&buf, 64*1024)
 	if _, err := io.Copy(bw, bodyReader); err != nil {
-		return fmt.Errorf("FETCH uid %d: read body: %w", uid, err)
+		return TransferOutcome{}, fmt.Errorf("FETCH uid %d: read body: %w", uid, err)
 	}
 	if err := bw.Flush(); err != nil {
-		return fmt.Errorf("FETCH uid %d: flush: %w", uid, err)
+		return TransferOutcome{}, fmt.Errorf("FETCH uid %d: flush: %w", uid, err)
 	}
+
 	// Drain any remaining fetch data (flags, etc.)
 	for fetchCmd.Next() != nil {
 	}
@@ -205,13 +408,41 @@ func (cl *Client) TransferMessage(uid imaplib.UID, dst *Client, dstFolder string
 	size := int64(buf.Len())
 	appendCmd := dst.inner.Append(dstFolder, size, &imaplib.AppendOptions{})
 	if _, err := io.Copy(appendCmd, bytes.NewReader(buf.Bytes())); err != nil {
-		return fmt.Errorf("APPEND stream %s: %w", dstFolder, err)
+		return TransferOutcome{}, fmt.Errorf("APPEND stream %s: %w", dstFolder, err)
 	}
 	if err := appendCmd.Close(); err != nil {
-		return fmt.Errorf("APPEND close %s: %w", dstFolder, err)
+		return TransferOutcome{}, fmt.Errorf("APPEND close %s: %w", dstFolder, err)
 	}
 	if _, err := appendCmd.Wait(); err != nil {
-		return fmt.Errorf("APPEND wait %s: %w", dstFolder, err)
+		return TransferOutcome{}, fmt.Errorf("APPEND wait %s: %w", dstFolder, err)
 	}
-	return nil
+	return TransferOutcome{Migrated: true, SizeBytes: size}, nil
+}
+
+func normalizeMessageID(v string) string {
+	v = strings.TrimSpace(v)
+	v = strings.Trim(v, "<>")
+	return strings.ToLower(v)
+}
+
+func extractMessageID(raw []byte) string {
+	headersEnd := bytes.Index(raw, []byte("\r\n\r\n"))
+	if headersEnd < 0 {
+		headersEnd = bytes.Index(raw, []byte("\n\n"))
+	}
+	if headersEnd < 0 {
+		headersEnd = len(raw)
+	}
+	headers := string(raw[:headersEnd])
+
+	for _, line := range strings.Split(headers, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(strings.ToLower(line), "message-id:") {
+			v := strings.TrimSpace(line[len("message-id:"):])
+			v = strings.Trim(v, "<>")
+			return v
+		}
+	}
+
+	return ""
 }
