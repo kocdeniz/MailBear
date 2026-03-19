@@ -1,6 +1,6 @@
 # MailMole
 
-![MailMole Header](mailmole_header.png)
+![MailMole Header](mailmole.jpeg)
 
 MailMole is a terminal-first IMAP-to-IMAP migration tool written in Go.
 It is designed for practical mailbox migration with a clear TUI, low-memory
