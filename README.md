@@ -167,7 +167,7 @@ exact names are created/copied on destination. This is normal IMAP behavior.
 
 ## Web Dashboard (Optional)
 
-MailMole includes an optional web dashboard for monitoring migrations from any browser.
+MailMole includes an optional web dashboard for monitoring and managing migrations from any browser.
 
 ### Usage
 
@@ -182,19 +182,55 @@ Run with web dashboard enabled:
 
 Then open `http://localhost:8080` in your browser.
 
-### Features
+### Web Dashboard Features
 
-- **Real-time monitoring** via Server-Sent Events (SSE)
-- Live progress bar and statistics
-- Per-folder and per-account status
-- Activity log viewer
-- Responsive design (works on mobile)
-- Dark theme matching the TUI
+#### 1. Connection Setup
+- **Quick Templates**: Pre-configured settings for Gmail, Outlook, Yandex, iCloud, Yahoo
+- **Single Account Mode**: Migrate one account at a time
+- **Bulk Migration Mode**: Migrate multiple accounts simultaneously
+- **Import/Export**: Load accounts from CSV/JSON files
 
-The web dashboard updates automatically as the migration progresses, making it ideal for:
-- Remote monitoring from another device
-- Sharing progress with team members
-- Running migrations on headless servers
+#### 2. Migration Templates
+Choose from 19 pre-configured migration templates:
+- Same provider migrations (Gmail→Gmail, Outlook→Outlook, etc.)
+- Cross-provider migrations (Gmail→Outlook, Outlook→Yandex, etc.)
+
+#### 3. Connection Validation
+- **Test Connection**: Quick connectivity check
+- **Detailed Test**: Comprehensive validation with per-account results
+- **Visual Status**: Success/error indicators with detailed error messages
+- **Export Results**: Download validation reports as CSV
+
+#### 4. Preview Mode
+- Review all folders before migration
+- View message counts and size estimates
+- Select/deselect specific folders
+- See estimated duration
+
+#### 5. Real-time Monitoring
+- Live progress tracking via Server-Sent Events (SSE)
+- Toast notifications for immediate feedback
+- Per-account migration status
+- Transfer speed and ETA
+
+#### 6. Scheduling
+- Schedule migrations for later execution
+- Repeat options: Daily, Weekly, Monthly
+- View and manage scheduled jobs
+
+#### 7. Activity Logs
+- Real-time log streaming
+- Filter by log level (INFO, WARN, ERROR)
+- Download complete logs
+
+### Ideal Use Cases
+
+The web dashboard is perfect for:
+- **Remote monitoring** from another device
+- **Team collaboration** - Share migration progress
+- **Headless servers** - Run without TUI
+- **Mobile access** - Monitor from your phone
+- **Bulk operations** - Manage hundreds of accounts
 
 ## Security notes
 
@@ -212,12 +248,51 @@ main.go                  # App entrypoint
 internal/ui/             # Bubble Tea model, update loop, rendering
 internal/sync/           # Queue parser and migration engine
 internal/imap/           # IMAP client wrapper and transfer operations
+internal/web/            # Web dashboard (HTTP server, SSE, HTML frontend)
 ```
+
+### Web Dashboard Features
+
+The web dashboard (`internal/web/`) provides a modern browser-based interface:
+
+- **Real-time Monitoring**: Server-Sent Events (SSE) for live updates
+- **Migration Templates**: Gmail, Outlook, Yandex, iCloud, Yahoo presets
+- **Import/Export**: CSV/JSON support for bulk account management
+- **Connection Validation**: Detailed test results with visual feedback
+- **Toast Notifications**: User-friendly status messages
+- **Responsive Design**: Works on desktop and mobile devices
+- **Scheduling**: Schedule migrations for later execution
+- **Multi-language Support**: English and Turkish (extensible)
+
+#### API Endpoints
+
+- `GET /` - Web dashboard interface
+- `POST /api/test-connection` - Test single account connection
+- `POST /api/preview` - Get folder preview for single account
+- `POST /api/bulk-preview` - Get folder preview for multiple accounts
+- `POST /api/validate` - Validate account connections with detailed results
+- `POST /api/schedule` - Schedule a migration job
+- `GET /api/schedules` - List scheduled jobs
+- `DELETE /api/schedule/delete?id=<job_id>` - Delete scheduled job
+- `GET /ws` - SSE endpoint for real-time updates
+
+## Multi-Language Support
+
+MailMole supports multiple languages in the web dashboard:
+
+- 🇬🇧 **English** (Default)
+- 🇹🇷 **Turkish** (Türkçe)
+
+Language is automatically detected from browser settings. To add a new language:
+
+1. Create a new translation file in `internal/web/locales/`
+2. Add the language code to the supported languages list
+3. Restart the web dashboard
 
 ## Known limitations
 
-- No JSON/CSV export of migration reports yet (web dashboard available)
-- Web dashboard has no built-in authentication
+- Web dashboard has no built-in authentication (run on trusted networks only)
+- Some advanced IMAP features (e.g., custom flags) are not preserved during migration
 
 ## Status
 
