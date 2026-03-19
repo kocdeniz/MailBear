@@ -57,6 +57,11 @@ for high throughput in large migrations.
 
 ## Quick start
 
+Download for Linux
+```bash
+wget https://github.com/kocdeniz/MailMole/releases/download/v1.0.0/mailmole_linux
+```
+
 Run from source:
 
 ```bash
